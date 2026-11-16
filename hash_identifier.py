@@ -62,9 +62,9 @@ Quote hashes in single quotes — bash eats `$2b$12$...` otherwise:
 
 # Standard library: parse command-line flags like `--top 3` into a
 # nice object so we do not have to slice `sys.argv` by hand.
-from operator import truediv
 import argparse
 import json
+import re
 import sys
 import shlex
 
@@ -99,7 +99,45 @@ from rich.markup import escape
 # prefer Literals for small fixed sets
 
 Confidence = Literal["high", "medium", "low"]
+# =============================================================================
+# Evidence weights — the numbers behind every confidence score
+# =============================================================================
+# Each kind of evidence has a base weight. A candidate's score is the base
+# weight for the strongest evidence, plus small bonuses, clamped to 0.0-1.0.
+# Same idea as a spam filter: weak signals in, one number out, then bucket
+# the number for display
 
+SCORE_PREFIX = 0.95  # a known `$algo$` prefix announces itself
+SCORE_SPECIAL_SHAPE = 0.85  # NetNTLM / MySQL5: unmistakable shape
+SCORE_LENGTH_FIRST = 0.55  # hex length match: divided by rank for the rest
+SCORE_GENERIC_PHC = 0.40  # `$name$...` shape only, no specific rule
+SCORE_NOT_A_HASH = 0.30  # shape hints: URL, JWT, base64...
+CHARSET_BONUS = 0.05  # small additive bonus for a clean charset
+
+# Display buckets: score > 0.8 is high, 0.5-0.8 is medium, below is low
+HIGH_SCORE_THRESHOLD = 0.8
+MEDIUM_SCORE_THRESHOLD = 0.5
+
+
+def confidence_bucket(score: float) -> Confidence:
+    """Map a 0.0-1.0 score to the three buckets the user sees"""
+    if score > HIGH_SCORE_THRESHOLD:
+        return "high"
+    if score >= MEDIUM_SCORE_THRESHOLD:
+        return "medium"
+    return "low"
+
+# =============================================================================
+# Crack difficulty type — how hard is this hash to attack?
+# =============================================================================
+# Same idea as Confidence: a Literal pins the value to four strings so mypy
+# catches typos. Rough guide, on one modern GPU:
+#   trivial    billions of guesses per second  (raw MD5, SHA-*)
+#   moderate   millions to hundreds of thousands (MD5 crypt, phpass)
+#   hard       thousands                         (bcrypt cost 12)
+#   very_hard  hundreds or fewer                 (Argon2id, 64 MiB)
+
+CrackDifficulty = Literal["trivial", "moderate", "hard", "very_hard"]
 
 # =============================================================================
 # Result type — what identify() returns for each guess
@@ -111,27 +149,33 @@ class HashCandidate:
     """
     One possible identification of a hash string
 
-    `frozen=True` makes the dataclass immutable — once created, its
-    fields cannot change. `slots=True` makes instances lightweight in
-    memory. Together these two flags create a clean "value object"
+    `frozen=True` makes the dataclass immutable, `slots=True` makes
+    instances lightweight
 
     Fields
     ------
     algorithm
         Human-readable algorithm name like "SHA-256" or "bcrypt"
-    confidence
-        How sure we are. "high" comes from definitive prefix matches,
-        "medium" from length matches that have only one obvious
-        candidate, "low" for length matches that could be many things
+    confidence_score
+        0.0-1.0, built from evidence weights (prefix, shape, length,
+        charset). Higher means more certain
     reason
-        Short explanation we display next to the algorithm name. Keeps
-        the output debuggable — the user can see WHY each guess fired
+        Short explanation shown next to the algorithm name
+    crack_difficulty
+        How hard the hash is to crack, or None when we cannot say
+        (not-a-hash hints, unknown PHC strings)
     """
     algorithm: str
-    confidence: Confidence
+    confidence_score: float
     reason: str
     hashcat_mode: int | None = None
     john_format: str | None = None
+    crack_difficulty:CrackDifficulty | None = None
+
+    @property
+    def confidence(self) -> Confidence:
+        """The display bucket, derived from the score (never stored)"""
+        return confidence_bucket(self.confidence_score)
 
 
 
@@ -290,29 +334,163 @@ JOHN_FORMATS: dict[str, str] = {
     "NetNTLMv1": "netntlm", "NetNTLMv2": "netntlmv2",
 }
 
+# =============================================================================
+# Crack difficulty — per-algorithm defaults, plus parameter parsing
+# =============================================================================
+# Keys must match the algorithm strings in PREFIX_RULES / HEX_LENGTH_RULES.
+# Missing key = we do not know (generic PHC strings, LDAP CRYPT, hints)
+
+CRACK_DIFFICULTY: dict[str, CrackDifficulty] = {
+    # Fast, unsalted-or-lightly-salted digests: billions of guesses per second
+    "MD5": "trivial", "MD4": "trivial", "NTLM": "trivial",
+    "SHA-1": "trivial", "SHA-224": "trivial", "SHA-256": "trivial",
+    "SHA-384": "trivial", "SHA-512": "trivial",
+    "SHA3-224": "trivial", "SHA3-256": "trivial",
+    "SHA3-384": "trivial", "SHA3-512": "trivial",
+    "RIPEMD-128": "trivial", "RIPEMD-160": "trivial",
+    "RIPEMD-256": "trivial", "RIPEMD-320": "trivial",
+    "Tiger-128": "trivial", "Tiger-192": "trivial",
+    "BLAKE2s-256": "trivial", "BLAKE2b-512": "trivial",
+    "Whirlpool": "trivial", "CRC-64": "trivial",
+    "MySQL323": "trivial", "MySQL5": "trivial",
+    "DES crypt": "trivial",
+    "LDAP SHA": "trivial", "LDAP SSHA": "trivial",
+    "LDAP MD5": "trivial", "LDAP SMD5": "trivial",
+    "NetNTLMv1": "trivial", "NetNTLMv2": "trivial",
+    # Iterated but GPU-friendly: millions to hundreds of thousands per second
+    "MD5 crypt": "moderate", "Apache MD5-crypt": "moderate",
+    "phpass": "moderate", "Drupal 7 (SHA-512)": "moderate",
+    "SHA-256 crypt": "moderate", "SHA-512 crypt": "moderate",
+    "Django PBKDF2-SHA1": "moderate",
+    # Many iterations or memory-hard: thousands per second
+    "Django PBKDF2-SHA256": "hard", "macOS / iCloud Keychain": "hard",
+    "yescrypt": "hard", "scrypt": "hard",
+    # Parameterised: these are FALLBACKS, used only when the cost
+    # parameters cannot be parsed out of the string
+    "bcrypt": "hard", "Django bcrypt-SHA256": "hard",
+    "Argon2id": "hard", "Argon2i": "hard", "Argon2d": "hard",
+    "Django Argon2": "hard",
+}
+
+_BCRYPT_ALGORITHMS = frozenset({"bcrypt", "Django bcrypt-SHA256"})
+_ARGON2_ALGORITHMS = frozenset(
+    {"Argon2id", "Argon2i", "Argon2d", "Django Argon2"}
+)
+
+# bcrypt: `$2b$12$...` — the two digits are the cost; work doubles per +1.
+# `search` (not `match`) so Django's `bcrypt_sha256$$2b$12$...` also works
+_BCRYPT_COST_RE = re.compile(r"\$2[abxy]\$(\d{2})\$")
+BCRYPT_DEFAULT_COST = 12
+BCRYPT_MODERATE_BELOW = 10
+BCRYPT_VERY_HARD_FROM = 14
+
+# Argon2: `$argon2id$v=19$m=65536,t=3,p=4$...` — m is memory in KiB,
+# t is passes, p is parallel lanes
+_ARGON2_PARAMS_RE = re.compile(r"m=(\d+),t=(\d+),p=(\d+)")
+ARGON2_MODERATE_BELOW_KIB = 8192  # 8 MiB
+ARGON2_VERY_HARD_FROM_KIB = 65536  # 64 MiB
+
+
+def _bcrypt_difficulty(text: str) -> tuple[CrackDifficulty, str] | None:
+    """Read the bcrypt cost factor and judge it; None if no cost found"""
+    match = _BCRYPT_COST_RE.search(text)
+    if match is None:
+        return None
+    cost = int(match.group(1))
+    difficulty: CrackDifficulty
+    if cost < BCRYPT_MODERATE_BELOW:
+        difficulty = "moderate"
+        note = f"cost={cost} — much weaker than the default {BCRYPT_DEFAULT_COST}"
+    elif cost < BCRYPT_DEFAULT_COST:
+        difficulty = "hard"
+        note = f"cost={cost} — below the modern default {BCRYPT_DEFAULT_COST}"
+    elif cost == BCRYPT_DEFAULT_COST:
+        difficulty = "hard"
+        note = f"cost={cost} — the modern default"
+    elif cost < BCRYPT_VERY_HARD_FROM:
+        difficulty = "hard"
+        note = f"cost={cost} — above the modern default {BCRYPT_DEFAULT_COST}"
+    else:
+        difficulty = "very_hard"
+        note = f"cost={cost} — paranoid setting"
+    return difficulty, note
+
+
+def _argon2_difficulty(text: str) -> tuple[CrackDifficulty, str] | None:
+    """Read Argon2 memory/time/lanes and judge them; None if absent"""
+    match = _ARGON2_PARAMS_RE.search(text)
+    if match is None:
+        return None
+    memory_kib = int(match.group(1))
+    time_cost = int(match.group(2))
+    lanes = int(match.group(3))
+    params = f"m={memory_kib / 1024:g} MiB, t={time_cost}, p={lanes}"
+    difficulty: CrackDifficulty
+    if memory_kib < ARGON2_MODERATE_BELOW_KIB:
+        difficulty = "moderate"
+        note = f"{params} — very little memory, weak for Argon2"
+    elif memory_kib < ARGON2_VERY_HARD_FROM_KIB:
+        difficulty = "hard"
+        note = f"{params} — reasonable memory cost"
+    else:
+        difficulty = "very_hard"
+        note = f"{params} — strong memory cost"
+    return difficulty, note
+
+
+def _assess_difficulty(
+    algorithm: str,
+    text: str,
+) -> tuple[CrackDifficulty | None, str]:
+    """
+    Return (difficulty, note) for one candidate
+
+    Parameterised algorithms (bcrypt, Argon2) are judged from the
+    parameters inside `text`. Everything else, and any parameterised
+    hash whose parameters will not parse, uses the CRACK_DIFFICULTY
+    table. The note is empty when there is nothing parameter-specific
+    to say
+    """
+    detail: tuple[CrackDifficulty, str] | None = None
+    if algorithm in _BCRYPT_ALGORITHMS:
+        detail = _bcrypt_difficulty(text)
+    elif algorithm in _ARGON2_ALGORITHMS:
+        detail = _argon2_difficulty(text)
+    if detail is not None:
+        return detail
+    return CRACK_DIFFICULTY.get(algorithm), ""
+    
+
 def _make_candidate(
     algorithm: str,
-    confidence: Confidence,
+    score: float,
     reason: str,
+    hash_text: str = "",
 ) -> HashCandidate:
     """
-    Build a HashCandidate and fill in its tool hints from the tables
+    Build a HashCandidate and fill in tool hints and crack difficulty
 
-    Every candidate in identify() goes through here, so the lookup
-    lives in exactly one place
+    `hash_text` is the hash string itself. Only the prefix step passes
+    it, because only PHC strings carry readable cost parameters. When
+    parsing yields a note (`cost=12 — the modern default`) it is
+    appended to the reason
     """
+    difficulty, note = _assess_difficulty(algorithm, hash_text)
+    if note:
+        reason = f"{reason}; {note}"
     return HashCandidate(
         algorithm = algorithm,
-        confidence = confidence,
+        confidence_score = round(min(max(score, 0.0), 1.0), 3),
         reason = reason,
         hashcat_mode = HASHCAT_MODES.get(algorithm),
         john_format = JOHN_FORMATS.get(algorithm),
+        crack_difficulty = difficulty,
     )
 
 # =============================================================================
 # Helpers
 # =============================================================================
- 
+
 def _is_hex(text: str) -> bool:
     """
     Return True iff every character in text is a hex digit and text is non-empty
@@ -323,6 +501,18 @@ def _is_hex(text: str) -> bool:
     than `c in "0123456789abcdef..."` for big inputs
     """
     return bool(text) and all(c in HEX_CHARSET for c in text)
+
+def _charset_bonus(text: str) -> float:
+    """
+    Return CHARSET_BONUS if hex text is single-case, else 0.0
+
+    Real hash output is always all-lowercase or all-uppercase hex.
+    Mixed case such as `5F4dcc...` is weaker evidence of a raw digest.
+    Digit-only strings count as single-case
+    """
+    if text == text.lower() or text == text.upper():
+        return CHARSET_BONUS
+    return 0.0
 
 
 # MySQL5 layout: `*` followed by 40 uppercase hex chars.
@@ -388,7 +578,7 @@ def _is_descrypt(text: str) -> bool:
         len(text) == _DESCRYPT_TOTAL_LENGTH
         and all(c in _DESCRYPT_CHARSET for c in text)
     )
-    
+
 # Base58 (Bitcoin alphabet) — no 0, O, I, or l, because they look alike.
 # Bitcoin addresses are 26-35 chars; IPFS CIDv0 is 46; WIF keys are 51-52.
 # Any plain alphanumeric word without those four letters is ALSO valid
@@ -486,7 +676,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
        they pasted instead of a silent no-match. The checks run in
        that order, because URLs and padded Base32 contain `/` and
        `=`, which the base64 check would otherwise swallow
-       
+
     6. If nothing matched at all, return an empty list
 
     Parameters
@@ -524,8 +714,9 @@ def identify(raw_input: str) -> list[HashCandidate]:
             return [
                 _make_candidate(
                     algorithm = algorithm,
-                    confidence = "high",
+                    score = SCORE_PREFIX,
                     reason = f"prefix `{prefix}` — {note}",
+                    hash_text = text,
                 )
             ]
 
@@ -555,7 +746,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
             return [
                 _make_candidate(
                     algorithm = "NetNTLMv2",
-                    confidence = "high",
+                    score = SCORE_SPECIAL_SHAPE,
                     reason =
                     "user::domain:challenge:hmac(32 hex):blob shape",
                 )
@@ -567,7 +758,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
             return [
                 _make_candidate(
                     algorithm = "NetNTLMv1",
-                    confidence = "high",
+                    score = SCORE_SPECIAL_SHAPE,
                     reason =
                     "user::domain:lm(48 hex):nt(48 hex):challenge shape",
                 )
@@ -578,7 +769,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "MySQL5",
-                confidence = "high",
+                score = SCORE_SPECIAL_SHAPE,
                 reason =
                 "starts with `*` followed by 40 uppercase hex chars",
             )
@@ -591,34 +782,32 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "DES crypt",
-                confidence = "medium",
+                score = SCORE_LENGTH_FIRST + CHARSET_BONUS,
                 reason =
                 "13 chars in `./0-9A-Za-z` — legacy /etc/passwd format",
             )
         ]
 
-    # ----- Step 3: length + hex charset -----
+        # ----- Step 3: length + hex charset -----
     if _is_hex(text):
         algorithms = HEX_LENGTH_RULES.get(len(text), [])
+        bonus = _charset_bonus(text)
         candidates: list[HashCandidate] = []
-        for index, algorithm in enumerate(algorithms):
-            # The first listed algorithm for each length is the modern
-            # default and gets MEDIUM confidence. The rest are still
-            # possible but less common in 2026 — LOW confidence
-            confidence: Confidence = "medium" if index == 0 else "low"
+        # rank is 1-based: 1st candidate scores 0.55, 2nd 0.275, 3rd 0.183...
+        # The charset bonus is added on top of each
+        for rank, algorithm in enumerate(algorithms, start = 1):
             label = (
                 "most likely candidate at this length"
-                if index == 0 else "also possible at this length"
+                if rank == 1 else "also possible at this length"
             )
             candidates.append(
                 _make_candidate(
                     algorithm = algorithm,
-                    confidence = confidence,
+                    score = SCORE_LENGTH_FIRST / rank + bonus,
                     reason = f"{len(text)} hex chars — {label}",
                 )
             )
         return candidates
-
     # ----- Step 4: generic PHC string fallback -----
     # If the input starts with `$<name>$...` and <name> looks like a
     # plausible algorithm identifier, it is almost certainly a PHC
@@ -646,7 +835,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 return [
                     _make_candidate(
                         algorithm = f"PHC string ({algo_name})",
-                        confidence = "low",
+                        score = SCORE_GENERIC_PHC,
                         reason =
                         f"`${algo_name}$...` shape — generic PHC, no specific rule",
                     )
@@ -664,7 +853,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "URL (not a hash)",
-                confidence = "low",
+                score = SCORE_NOT_A_HASH,
                 reason = "starts with `http://` or `https://` — a web address",
             )
         ]
@@ -683,7 +872,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "0x hex value (not a password hash)",
-                confidence = "low",
+                score = SCORE_NOT_A_HASH,
                 reason = hint,
             )
         ]
@@ -693,7 +882,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "JWT (not a hash)",
-                confidence = "low",
+                score = SCORE_NOT_A_HASH,
                 reason =
                 "leading `eyJ` is base64 of `{\"` — JWT, not a hash",
             )
@@ -703,7 +892,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "Base32 string (not a hash)",
-                confidence = "low",
+                score = SCORE_NOT_A_HASH,
                 reason =
                 "only A-Z and 2-7 — TOTP secret, onion address, or other Base32 data",
             )
@@ -713,7 +902,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "Base58 string (not a hash)",
-                confidence = "low",
+                score = SCORE_NOT_A_HASH,
                 reason =
                 "only Base58 characters — Bitcoin address or IPFS CID? weak signal, could be any token",
             )
@@ -724,7 +913,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
         return [
             _make_candidate(
                 algorithm = "Base64 blob (not a hash)",
-                confidence = "low",
+                score = SCORE_NOT_A_HASH,
                 reason = "contains base64-only chars (`+`, `/`, `=`)",
             )
         ]
@@ -736,6 +925,123 @@ def identify(raw_input: str) -> list[HashCandidate]:
     # is better than returning bad guesses — the CLI prints a
     # clean "could not identify" message instead
     return []
+
+    # =============================================================================
+# Field splitting — a layer ON TOP of identify()
+# =============================================================================
+# Breach dumps often hold combined records like `user:hash:salt`. This layer
+# splits on `:` and labels each field. It never changes identify(); it just
+# calls it once per field and adds position-based heuristics
+
+FieldRole = Literal["username", "hash", "salt", "garbage", "empty"]
+
+
+@dataclass(frozen = True, slots = True)
+class SplitField:
+    """
+    One colon-separated field and what we think it is
+
+    position    1-based index of the field in the record
+    value       the field text, whitespace-trimmed
+    role        username / hash / salt / garbage / empty
+    detail      short reason shown in the table
+    candidate   the top HashCandidate when role == "hash", else None
+    """
+    position: int
+    value: str
+    role: FieldRole
+    detail: str
+    candidate: HashCandidate | None = None
+
+
+# Every "not a hash" hint in step 5 of identify() contains this marker:
+# "URL (not a hash)", "0x hex value (not a password hash)", ...
+_NOT_A_HASH_MARKER = "(not a"
+
+# Starts with a letter, then letters/digits/`.`/`_`/`@`/`-`, max 32 chars
+# (covers `alice`, `bob_99`, `alice@example.com`)
+_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9._@-]{0,31}")
+_SALT_MAX_LENGTH = 64
+
+
+def _top_hash_candidate(value: str) -> HashCandidate | None:
+    """
+    Return identify()'s best guess for `value`, but only if it is a real hash
+
+    Returns None for empty fields, all-letter fields (usernames — this
+    stops a 13-letter name matching DES crypt), and the "not a hash" hints
+    """
+    if not value or value.isalpha():
+        return None
+    candidates = identify(value)
+    if not candidates or _NOT_A_HASH_MARKER in candidates[0].algorithm:
+        return None
+    return candidates[0]
+
+
+def _classify_field(
+    position: int,
+    value: str,
+    candidate: HashCandidate | None,
+    before_hash: bool,
+) -> SplitField:
+    """Label one field using its hash result and where it sits in the record"""
+    if not value:
+        return SplitField(position, value, "empty", "empty field")
+    if candidate is not None:
+        detail = f"{candidate.algorithm} ({candidate.confidence} confidence)"
+        return SplitField(position, value, "hash", detail, candidate)
+    if before_hash:
+        if _USERNAME_RE.fullmatch(value):
+            return SplitField(
+                position, value, "username", "name-shaped text before the hash"
+            )
+        return SplitField(
+            position, value, "garbage", "not a hash and not name-shaped"
+        )
+    if len(value) <= _SALT_MAX_LENGTH and not any(c.isspace() for c in value):
+        return SplitField(position, value, "salt", "short token after the hash")
+    return SplitField(
+        position, value, "garbage", "too long or has whitespace for a salt"
+    )
+
+
+def split_fields(raw_input: str) -> list[SplitField]:
+    """
+    Split a `user:hash:salt`-style record and classify every field
+
+    A record that is ALREADY a high-confidence format as a whole (NetNTLM
+    lines are full of colons) is returned as one hash field instead of
+    being torn apart. Blank input returns an empty list
+    """
+    text = raw_input.strip()
+    if not text:
+        return []
+
+    whole = identify(text)
+    if whole and whole[0].confidence == "high":
+        detail = f"{whole[0].algorithm} (whole record, not split)"
+        return [SplitField(1, text, "hash", detail, whole[0])]
+
+    values = [part.strip() for part in text.split(":")]
+    candidates = [_top_hash_candidate(value) for value in values]
+    # Index of the first real hash, or None. `is None` (not `or`) because
+    # index 0 is a valid position and is falsy
+    first_hash = next(
+        (i for i, candidate in enumerate(candidates) if candidate is not None),
+        None,
+    )
+
+    return [
+        _classify_field(
+            position = index + 1,
+            value = value,
+            candidate = candidate,
+            before_hash = first_hash is None or index < first_hash,
+        ) for index, (value, candidate) in enumerate(
+            zip(values, candidates, strict = True)
+        )
+    ]
 
 
 # =============================================================================
@@ -781,6 +1087,13 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         metavar = "PATH",
         help = "Read one hash per line from a file (blank lines are skipped).",
     )
+    parser.add_argument(
+        "--split",
+        "-s",
+        action = "store_true",
+        help = "Treat each input as a colon-separated record "
+        "(user:hash:salt) and classify every field.",
+    )
     return parser
 
 
@@ -792,8 +1105,8 @@ def _render_table(
     """
     Print a rich Table showing the identified candidates
 
-    A Table is a bordered grid. We give it three columns: algorithm,
-    confidence (color-coded), and reason
+    A Table is a bordered grid. We give it six columns: algorithm,
+    confidence (color-coded),difficulty,reason,hashcat and john format
     """
     table = Table(
         title = f"Candidates for: {raw_input.strip()}",
@@ -802,11 +1115,12 @@ def _render_table(
     )
     table.add_column("algorithm", style = "bold white", no_wrap = True)
     table.add_column("confidence", no_wrap = True)
+    table.add_column("difficulty", no_wrap = True)
     table.add_column("reason", style = "dim")
     table.add_column("hashcat -m" , justify= "right" ,no_wrap=True)
     table.add_column("john --format" , no_wrap= True)
 
-    
+
 
     # Color confidence levels so the eye can scan them quickly.
     # green → yellow → cyan is a gradient that reads "strong, weaker,
@@ -823,14 +1137,100 @@ def _render_table(
     for candidate in candidates:
         color = confidence_colors[candidate.confidence]
         table.add_row(
-        candidate.algorithm,
-        f"[{color}]{candidate.confidence}[/{color}]",
-        candidate.reason,
-        "-" if candidate.hashcat_mode is None else str (candidate.hashcat_mode),
-        candidate.john_format or "-",
-    )
-        
+            candidate.algorithm,
+            f"[{color}]{candidate.confidence} "
+            f"({candidate.confidence_score:.2f})[/{color}]",
+            candidate.crack_difficulty or "-",
+            candidate.reason,
+            "-" if candidate.hashcat_mode is None else str(candidate.hashcat_mode),
+            candidate.john_format or "-",
+        )
+
     console.print(table)
+
+
+
+
+_ROLE_COLORS: dict[FieldRole, str] = {
+    "username": "cyan",
+    "hash": "green",
+    "salt": "yellow",
+    "garbage": "red",
+    "empty": "dim",
+    }
+
+
+
+
+
+def _render_split_table(
+    record: str,
+    fields: list[SplitField],
+    count: int,
+    console: Console,
+) -> None:
+    """Print one table per record: field number, value, role, reason"""
+    suffix = f" (repeated {count} times)" if count > 1 else ""
+    table = Table(
+        title = f"Fields in: {escape(record)}{suffix}",
+        title_style = "bold cyan",
+    )
+    table.add_column("#", justify = "right", no_wrap = True)
+    # overflow="fold" wraps long values (a 60-char bcrypt) instead of
+    # cutting them off with an ellipsis
+    table.add_column("field", overflow = "fold")
+    table.add_column("role", no_wrap = True)
+    table.add_column("detail", style = "dim")
+    for field in fields:
+        color = _ROLE_COLORS[field.role]
+        table.add_row(
+            str(field.position),
+            escape(field.value) or "(empty)",
+            f"[{color}]{field.role}[/{color}]",
+            escape(field.detail),
+        )
+    console.print(table)
+
+
+def _run_split(
+    records: list[str],
+    counts: Counter[str],
+    as_json: bool,
+    is_batch: bool,
+    console: Console,
+) -> int:
+    """
+    Run --split mode over the unique records and return an exit code
+
+    JSON always exits 0 (the caller reads the roles). Text mode exits 1
+    if any record had no hash field at all
+    """
+    results = [(record, split_fields(record)) for record in records]
+
+    if as_json:
+        payload = [
+            {
+                "input": record,
+                "count": counts[record],
+                "fields": [asdict(f) for f in fields],
+            } for record, fields in results
+        ]
+        output = payload if is_batch else {
+            "input": payload[0]["input"],
+            "fields": payload[0]["fields"],
+        }
+        print(json.dumps(output, indent = 2, ensure_ascii = False))
+        return 0
+
+    without_hash = 0
+    for record, fields in results:
+        _render_split_table(record, fields, counts[record], console)
+        if not any(f.role == "hash" for f in fields):
+            without_hash += 1
+            console.print("[red]no hash field found in this record[/red]")
+    return 0 if without_hash == 0 else 1
+
+
 
 
 def _read_hash_file(path: str, console: Console) -> list[str] | None:
@@ -844,7 +1244,7 @@ def _read_hash_file(path: str, console: Console) -> list[str] | None:
     failure mode for a CLI a beginner is using for the first time
     """
     try:
-        with open(path, "r", encoding = "utf-8", errors = "replace") as handle:
+        with open(path, encoding = "utf-8", errors = "replace") as handle:
             return [line.strip() for line in handle if line.strip()]
     except OSError as error:
         console.print(f"[red]could not read `{path}`:[/red] {error}")
@@ -919,6 +1319,10 @@ def main() -> int:
     # user typed them some other way
     if len(unique_hashes) > 1:
         is_batch = True
+
+        # ----- --split mode: classify colon-separated fields -----
+    if args.split:
+        return _run_split(unique_hashes, hash_counts, args.json, is_batch, console)
 
     # ----- JSON output (single object, or array for batches) -----
     if args.json:

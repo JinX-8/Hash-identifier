@@ -68,11 +68,13 @@ top-ranked candidate
 # decorator to expand one test function into many test cases
 # Third-party: the test runner itself. We also need it imported here
 # so we can use its `@pytest.mark.parametrize` decorator below.
+import json
+import sys
 import pytest
 
 # Local: our own module. We pull in the public pieces under test —
 # the prefix-rule table, the result dataclass, and the entry function.
-from hash_identifier import HASHCAT_MODES,JOHN_FORMATS,PREFIX_RULES,HEX_LENGTH_RULES, HashCandidate, identify
+from hash_identifier import HASHCAT_MODES,JOHN_FORMATS,PREFIX_RULES,HEX_LENGTH_RULES, HashCandidate, identify,main,split_fields,confidence_bucket,CRACK_DIFFICULTY
 
 # =============================================================================
 # Prefix matches (high confidence)
@@ -115,7 +117,7 @@ def test_macos_keychain_prefix_is_recognized() -> None:
     candidates = identify(sample)
     assert candidates
     assert candidates[0].algorithm == "macOS / iCloud Keychain"
-    assert candidates[0].confidence == "high"    
+    assert candidates[0].confidence == "high"
 
 
 def test_argon2id_prefix_is_recognized() -> None:
@@ -504,7 +506,7 @@ def test_hash_candidate_is_frozen() -> None:
     # First, construct a normal instance
     candidate = HashCandidate(
         algorithm = "MD5",
-        confidence = "medium",
+        confidence_score = 0.6,
         reason = "test",
     )
 
@@ -663,3 +665,301 @@ def test_base58_ipfs_cid_is_recognized() -> None:
 def test_plain_long_word_is_not_flagged_as_base58() -> None:
     # Valid Base58 characters, but no digits — ordinary text, not an address
     assert identify("thequickbrownfoxjumpsoverthedog") == []
+
+# =============================================================================
+# Field splitting (Challenge 3.1)
+# =============================================================================
+
+MD5_SAMPLE = "5f4dcc3b5aa765d61d8327deb882cf99"
+BCRYPT_SAMPLE = "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G"
+
+
+def _roles(record: str) -> list[str]:
+    return [f.role for f in split_fields(record)]
+
+
+def test_split_user_and_bcrypt() -> None:
+    fields = split_fields(f"alice:{BCRYPT_SAMPLE}")
+    assert [f.role for f in fields] == ["username", "hash"]
+    assert fields[1].candidate is not None
+    assert fields[1].candidate.algorithm == "bcrypt"
+
+
+def test_split_user_hash_salt() -> None:
+    fields = split_fields(f"bob:{MD5_SAMPLE}:salt123")
+    assert [f.role for f in fields] == ["username", "hash", "salt"]
+    assert fields[1].candidate is not None
+    assert fields[1].candidate.algorithm == "MD5"
+
+
+def test_split_positions_are_one_based() -> None:
+    assert [f.position for f in split_fields(f"bob:{MD5_SAMPLE}:x")] == [1, 2, 3]
+
+
+def test_split_thirteen_letter_username_is_not_descrypt() -> None:
+    # "administrator" is 13 letters — exactly the DES crypt shape
+    assert _roles(f"administrator:{MD5_SAMPLE}") == ["username", "hash"]
+
+
+def test_split_base64_salt_after_hash_is_a_salt() -> None:
+    # identify() calls this a base64 blob (not a hash), so it must not
+    # be mistaken for a second hash
+    assert _roles(f"bob:{MD5_SAMPLE}:c2FsdHNhbHQ=") == [
+        "username", "hash", "salt"
+    ]
+
+
+def test_split_lm_nt_pair_gives_two_hashes() -> None:
+    lm_hash = "aad3b435b51404eeaad3b435b51404ee"
+    nt_hash = "31d6cfe0d16ae931b73c59d7e0c089c0"
+    assert _roles(f"user:{lm_hash}:{nt_hash}") == [
+        "username", "hash", "hash"
+    ]
+
+
+def test_split_empty_field_is_labeled_empty() -> None:
+    assert _roles(f"bob:{MD5_SAMPLE}:") == ["username", "hash", "empty"]
+
+
+def test_split_without_a_hash_has_no_hash_role() -> None:
+    assert "hash" not in _roles("foo:bar")
+
+
+def test_split_non_name_before_hash_is_garbage() -> None:
+    assert _roles(f"1001:{MD5_SAMPLE}") == ["garbage", "hash"]
+
+
+def test_split_netntlm_line_is_kept_whole() -> None:
+    sample = "alice::CORP:1122334455667788:" + "a" * 32 + ":" + "b" * 64
+    fields = split_fields(sample)
+    assert len(fields) == 1
+    assert fields[0].role == "hash"
+    assert fields[0].candidate is not None
+    assert fields[0].candidate.algorithm == "NetNTLMv2"
+
+
+def test_split_blank_input_returns_nothing() -> None:
+    assert split_fields("   ") == []
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "https://example.com/x",
+        "0x" + "ab" * 20,
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+        "JBSWY3DPEHPK3PXP",
+        "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+        "VGhpcyBpcyBub3QgYSBoYXNoLCBpdHMgYmFzZTY0Lg==",
+    ],
+)
+def test_every_not_a_hash_hint_carries_the_marker(sample: str) -> None:
+    # split_fields relies on this marker to avoid calling hints "hashes"
+    assert "(not a" in identify(sample)[0].algorithm
+
+
+def test_split_cli_json(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["hashid", "--split", "--json", f"bob:{MD5_SAMPLE}:salt123"]
+    )
+    assert main() == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [f["role"] for f in data["fields"]] == ["username", "hash", "salt"]
+    assert data["fields"][1]["candidate"]["hashcat_mode"] == 0
+
+
+def test_split_cli_exits_1_when_no_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["hashid", "--split", "foo:bar"])
+    assert main() == 1
+# ----- Challenge 3.2: evidence-weighted scores -----
+
+
+def test_prefix_match_scores_095() -> None:
+    top = identify("$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G")[0]
+    assert top.confidence_score == pytest.approx(0.95)
+
+
+def test_special_shape_scores_085() -> None:
+    assert identify("*" + "A" * 40)[0].confidence_score == pytest.approx(0.85)
+
+
+def test_des_crypt_scores_060() -> None:
+    top = identify("ab12CD34ef56g")[0]
+    assert top.algorithm == "DES crypt"
+    assert top.confidence_score == pytest.approx(0.60)
+
+
+def test_generic_phc_scores_040() -> None:
+    assert identify("$foo$bar")[0].confidence_score == pytest.approx(0.40)
+
+
+def test_not_a_hash_hint_scores_030() -> None:
+    top = identify("https://example.com")[0]
+    assert top.confidence_score == pytest.approx(0.30)
+
+
+def test_length_scores_divide_by_rank() -> None:
+    scores = [
+        c.confidence_score
+        for c in identify("5f4dcc3b5aa765d61d8327deb882cf99")
+    ]
+    # rank 1, 2, 3 = 0.55/N plus the 0.05 charset bonus
+    assert scores[0] == pytest.approx(0.60, abs = 0.001)
+    assert scores[1] == pytest.approx(0.325, abs = 0.001)
+    assert scores[2] == pytest.approx(0.233, abs = 0.001)
+
+
+def test_mixed_case_hex_gets_no_charset_bonus() -> None:
+    top = identify("5F4dcc3b5aa765d61d8327deb882cf99")[0]
+    assert top.confidence_score == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "5f4dcc3b5aa765d61d8327deb882cf99",
+        "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G",
+        "*" + "A" * 40,
+        "https://example.com",
+        "ab12CD34ef56g",
+        "$foo$bar",
+    ],
+)
+def test_scores_are_in_range_and_sorted(text: str) -> None:
+    scores = [c.confidence_score for c in identify(text)]
+    assert scores
+    assert all(0.0 <= s <= 1.0 for s in scores)
+    assert scores == sorted(scores, reverse = True)
+
+
+@pytest.mark.parametrize(
+    ("score", "bucket"),
+    [
+        (0.95, "high"),
+        (0.85, "high"),
+        (0.80, "medium"),
+        (0.60, "medium"),
+        (0.50, "medium"),
+        (0.499, "low"),
+        (0.30, "low"),
+        (0.0, "low"),
+    ],
+)
+def test_confidence_bucket_boundaries(score: float, bucket: str) -> None:
+    assert confidence_bucket(score) == bucket
+
+
+def test_candidate_confidence_property_matches_score() -> None:
+    candidate = HashCandidate("x", 0.9, "reason")
+    assert candidate.confidence == "high"
+
+
+def test_json_output_has_score_not_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["hashid", "--json", "5f4dcc3b5aa765d61d8327deb882cf99"]
+    )
+    assert main() == 0
+    top = json.loads(capsys.readouterr().out)["candidates"][0]
+    assert top["confidence_score"] == pytest.approx(0.60)
+    assert "confidence" not in top
+# ----- Challenge 3.3: crack difficulty -----
+
+_BCRYPT_TAIL = "EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G"
+
+
+def _bcrypt(cost: int) -> str:
+    return f"$2b${cost:02d}${_BCRYPT_TAIL}"
+
+
+def test_raw_md5_is_trivial() -> None:
+    top = identify("5f4dcc3b5aa765d61d8327deb882cf99")[0]
+    assert top.crack_difficulty == "trivial"
+
+
+def test_fixed_cost_hash_uses_the_table() -> None:
+    assert identify("$1$salt$abcdefghijklmnopqrstuv")[0].crack_difficulty == (
+        "moderate"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cost", "difficulty"),
+    [
+        (4, "moderate"),
+        (9, "moderate"),
+        (10, "hard"),
+        (12, "hard"),
+        (13, "hard"),
+        (14, "very_hard"),
+        (31, "very_hard"),
+    ],
+)
+def test_bcrypt_difficulty_follows_cost(cost: int, difficulty: str) -> None:
+    assert identify(_bcrypt(cost))[0].crack_difficulty == difficulty
+
+
+def test_bcrypt_reason_mentions_the_cost() -> None:
+    assert "cost=4 — much weaker" in identify(_bcrypt(4))[0].reason
+    assert "cost=12 — the modern default" in identify(_bcrypt(12))[0].reason
+    assert "cost=14 — paranoid" in identify(_bcrypt(14))[0].reason
+
+
+def test_bcrypt_without_a_readable_cost_falls_back_to_table() -> None:
+    top = identify("$2b$xx$" + _BCRYPT_TAIL)[0]
+    assert top.algorithm == "bcrypt"
+    assert top.crack_difficulty == "hard"
+
+
+@pytest.mark.parametrize(
+    ("memory_kib", "difficulty"),
+    [
+        (4096, "moderate"),
+        (19456, "hard"),
+        (65536, "very_hard"),
+    ],
+)
+def test_argon2_difficulty_follows_memory(
+    memory_kib: int,
+    difficulty: str,
+) -> None:
+    text = f"$argon2id$v=19$m={memory_kib},t=3,p=4$c29tZXNhbHQ$aGFzaGhhc2g"
+    assert identify(text)[0].crack_difficulty == difficulty
+
+
+def test_argon2_reason_shows_memory_in_mib() -> None:
+    text = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$aGFzaGhhc2g"
+    assert "m=64 MiB, t=3, p=4" in identify(text)[0].reason
+
+
+def test_argon2_without_params_falls_back_to_table() -> None:
+    assert identify("$argon2id$garbage")[0].crack_difficulty == "hard"
+
+
+def test_not_a_hash_hints_have_no_difficulty() -> None:
+    assert identify("https://example.com")[0].crack_difficulty is None
+
+
+def test_unknown_phc_string_has_no_difficulty() -> None:
+    assert identify("$foo$bar")[0].crack_difficulty is None
+
+
+def test_every_known_algorithm_has_a_difficulty() -> None:
+    names = {algorithm for _, algorithm, _ in PREFIX_RULES}
+    for algorithms in HEX_LENGTH_RULES.values():
+        names.update(algorithms)
+    # LDAP CRYPT wraps some other crypt(3) hash, so it has no fixed answer
+    missing = {n for n in names if n not in CRACK_DIFFICULTY}
+    assert missing == {"LDAP CRYPT"}
+
+
+def test_json_output_includes_crack_difficulty(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["hashid", "--json", _bcrypt(4)])
+    assert main() == 0
+    top = json.loads(capsys.readouterr().out)["candidates"][0]
+    assert top["crack_difficulty"] == "moderate"
