@@ -459,7 +459,7 @@ def _assess_difficulty(
     if detail is not None:
         return detail
     return CRACK_DIFFICULTY.get(algorithm), ""
-    
+
 
 def _make_candidate(
     algorithm: str,

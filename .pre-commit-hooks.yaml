@@ -1,0 +1,6 @@
+- id: hash-guard
+  name: refuse committed password hashes
+  description: Blocks commits containing likely password hashes (high confidence only)
+  entry: hash-guard
+  language: python
+  types: [text]

@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: hash-guard
+        name: refuse committed password hashes
+        entry: uv run python hash_hook.py
+        language: system
+        types: [text]
+        # Our own fixtures are full of hashes on purpose
+        exclude: ^(test_.*\.py|test-hashes\.txt|README\.md)$
